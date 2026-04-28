@@ -91,3 +91,9 @@ No subir nunca al repo:
 - Archivos `.streamlit/secrets.toml`.
 
 Si una credencial fue compartida o commiteada accidentalmente, rotarla inmediatamente.
+
+## Nota de compatibilidad Streamlit / PyArrow
+
+La app fuerza las columnas de texto/mixed object a string antes de mostrarlas con `st.dataframe`. Esto evita errores de PyArrow cuando el Excel trae columnas mixtas, por ejemplo `CAMPAÑA` con texto, números o valores vacíos.
+
+También se incluye `runtime.txt` para sugerir Python 3.12 en Streamlit Cloud.

@@ -69,6 +69,51 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return export.to_csv(index=False).encode("utf-8-sig")
 
 
+def _cell_to_streamlit_safe(value):
+    """Convierte celdas mixtas/listas/dicts a valores serializables por PyArrow."""
+    if isinstance(value, (list, tuple, set)):
+        return " | ".join(str(v) for v in value)
+    if isinstance(value, dict):
+        return str(value)
+    if pd.isna(value):
+        return ""
+    return str(value)
+
+
+def dataframe_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    """Evita errores Arrow cuando una columna object mezcla texto, números y NaN."""
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_object_dtype(out[col]) or pd.api.types.is_string_dtype(out[col]):
+            out[col] = out[col].map(_cell_to_streamlit_safe).astype("string")
+    return out
+
+
+def safe_dataframe(df: pd.DataFrame, **kwargs) -> None:
+    data = dataframe_for_streamlit(df)
+    try:
+        st.dataframe(data, width="stretch", **kwargs)
+    except TypeError:
+        st.dataframe(data, use_container_width=True, **kwargs)
+
+
+def safe_plotly_chart(fig, **kwargs) -> None:
+    try:
+        st.plotly_chart(fig, width="stretch", **kwargs)
+    except TypeError:
+        st.plotly_chart(fig, use_container_width=True, **kwargs)
+
+
+def safe_folium_map(fmap, height: int = 620):
+    try:
+        return st_folium(fmap, height=height, width="stretch")
+    except TypeError:
+        try:
+            return st_folium(fmap, height=height, width=1200)
+        except TypeError:
+            return st_folium(fmap, height=height, use_container_width=True)
+
+
 def run_scan(df_policies: pd.DataFrame, api_key: str, thresholds: AlertThresholds, max_workers: int) -> pd.DataFrame:
     results = []
     total = len(df_policies)
@@ -151,7 +196,7 @@ c3.metric("Pólizas a analizar", f"{len(df_policies):,}")
 c4.metric("Campaña gruesa", f"{stats['gruesa']:,}")
 
 with st.expander("Vista previa de pólizas preparadas", expanded=False):
-    st.dataframe(df_policies.head(50), use_container_width=True)
+    safe_dataframe(df_policies.head(50))
 
 if len(df_policies) == 0:
     st.warning("No quedaron pólizas para analizar luego de aplicar filtros de coordenadas/campaña.")
@@ -219,7 +264,7 @@ else:
     with tab1:
         fmap = build_alert_map(df_results, include_no_alerts=include_no_alerts_map)
         if fmap:
-            st_folium(fmap, height=620, use_container_width=True)
+            safe_folium_map(fmap, height=620)
             with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
                 map_path = map_to_html_file(fmap, tmp.name)
                 st.download_button(
@@ -249,7 +294,7 @@ else:
             "API_STATUS",
         ]
         show_cols = [c for c in cols if c in df_results.columns]
-        st.dataframe(df_results[show_cols].sort_values(["TIENE_ALERTA", "RIESGO"], ascending=[False, False]), use_container_width=True)
+        safe_dataframe(df_results[show_cols].sort_values(["TIENE_ALERTA", "RIESGO"], ascending=[False, False]))
         st.download_button(
             "Descargar resultados CSV",
             data=to_csv_bytes(df_results),
@@ -263,16 +308,16 @@ else:
             risk_counts = df_results["RIESGO"].value_counts().reset_index()
             risk_counts.columns = ["RIESGO", "CANTIDAD"]
             fig = px.bar(risk_counts, x="RIESGO", y="CANTIDAD", title="Distribución por nivel de riesgo")
-            st.plotly_chart(fig, use_container_width=True)
+            safe_plotly_chart(fig)
         with g2:
             prov_counts = alerts_df.groupby("PROVINCIA", dropna=False).size().reset_index(name="ALERTAS").sort_values("ALERTAS", ascending=False)
             fig2 = px.bar(prov_counts.head(15), x="PROVINCIA", y="ALERTAS", title="Alertas por provincia")
-            st.plotly_chart(fig2, use_container_width=True)
+            safe_plotly_chart(fig2)
 
         st.markdown("**Top campos por lluvia acumulada 72h**")
         top_cols = ["ASEGURADO", "CAMPO", "PROVINCIA", "DEPTO", "CULTIVO", "LLUVIA_72H_MM", "VIENTO_MAX_KMH", "TMIN_MIN_C", "RIESGO"]
         top_cols = [c for c in top_cols if c in df_results.columns]
-        st.dataframe(df_results[top_cols].sort_values("LLUVIA_72H_MM", ascending=False).head(20), use_container_width=True)
+        safe_dataframe(df_results[top_cols].sort_values("LLUVIA_72H_MM", ascending=False).head(20))
 
     with tab4:
         st.warning("Para enviar emails desde Streamlit Cloud, configurá credenciales en Secrets. No las subas al repo.")
