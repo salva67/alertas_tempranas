@@ -214,6 +214,113 @@ def fetch_visual_crossing(
     return None, last_error
 
 
+def fetch_open_meteo(
+    lat: float,
+    lon: float,
+    days: int = 3,
+    timeout: int = 30,
+    retries: int = 2,
+) -> Tuple[Optional[pd.DataFrame], str]:
+    """Consulta Open-Meteo y devuelve dataframe diario de pronóstico.
+
+    No requiere API key. Se usa como fuente principal o fallback cuando Visual Crossing falla.
+    """
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "precipitation_sum,temperature_2m_min,wind_speed_10m_max",
+        "forecast_days": max(int(days), 1),
+        "timezone": "America/Argentina/Buenos_Aires",
+        "wind_speed_unit": "kmh",
+        "precipitation_unit": "mm",
+    }
+
+    last_error = ""
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code != 200:
+                last_error = f"OPEN_METEO HTTP {resp.status_code}: {resp.text[:250].replace(chr(10), ' ')}"
+                if resp.status_code >= 500 and attempt < retries:
+                    time.sleep(1.2 * attempt)
+                    continue
+                return None, last_error
+
+            data = resp.json()
+            daily = data.get("daily", {})
+            if not daily or "time" not in daily:
+                return None, "OPEN_METEO respuesta sin bloque daily/time"
+
+            df_day = pd.DataFrame(
+                {
+                    "FECHA": daily.get("time", []),
+                    "PRECIP_MM": daily.get("precipitation_sum", []),
+                    "TMIN_C": daily.get("temperature_2m_min", []),
+                    "VIENTO_KMH": daily.get("wind_speed_10m_max", []),
+                }
+            ).head(days)
+
+            if df_day.empty:
+                return None, "OPEN_METEO daily vacío"
+
+            for col in ["PRECIP_MM", "VIENTO_KMH", "TMIN_C"]:
+                df_day[col] = pd.to_numeric(df_day[col], errors="coerce")
+            df_day["CONDICIONES"] = ""
+            df_day["DESCRIPCION"] = ""
+            return df_day, "OK_OPEN_METEO"
+        except requests.Timeout:
+            last_error = f"OPEN_METEO Timeout mayor a {timeout}s"
+            if attempt < retries:
+                time.sleep(1.2 * attempt)
+                continue
+        except requests.RequestException as exc:
+            last_error = f"OPEN_METEO error de request: {exc}"
+            if attempt < retries:
+                time.sleep(1.2 * attempt)
+                continue
+        except json.JSONDecodeError:
+            return None, "OPEN_METEO respuesta no es JSON válido"
+        except Exception as exc:  # noqa: BLE001
+            return None, f"OPEN_METEO error inesperado: {type(exc).__name__}: {exc}"
+
+    return None, last_error
+
+
+def fetch_weather_forecast(
+    lat: float,
+    lon: float,
+    api_key: str = "",
+    days: int = 3,
+    provider: str = "Auto: Visual Crossing + fallback Open-Meteo",
+) -> Tuple[Optional[pd.DataFrame], str]:
+    """Obtiene pronóstico según proveedor elegido.
+
+    provider:
+    - Auto: Visual Crossing + fallback Open-Meteo
+    - Open-Meteo sin API key
+    - Visual Crossing únicamente
+    """
+    provider_norm = str(provider or "").strip().lower()
+
+    if "open-meteo" in provider_norm and "visual" not in provider_norm:
+        return fetch_open_meteo(lat, lon, days=days)
+
+    if "visual" in provider_norm and "únicamente" in provider_norm:
+        return fetch_visual_crossing(lat, lon, api_key=api_key, days=days)
+
+    # Modo auto: intenta Visual Crossing si hay key real; si falla, usa Open-Meteo.
+    vc_df, vc_status = fetch_visual_crossing(lat, lon, api_key=api_key, days=days) if api_key else (None, "VISUAL_CROSSING omitido: sin API key")
+    if vc_df is not None and not vc_df.empty:
+        return vc_df, "OK_VISUAL_CROSSING"
+
+    om_df, om_status = fetch_open_meteo(lat, lon, days=days)
+    if om_df is not None and not om_df.empty:
+        return om_df, f"OK_OPEN_METEO | fallback usado; Visual Crossing: {vc_status}"
+
+    return None, f"Sin dato. Visual Crossing: {vc_status} | Open-Meteo: {om_status}"
+
+
 def evaluate_forecast(df_day: pd.DataFrame, thresholds: AlertThresholds) -> Tuple[List[str], str, Dict[str, float]]:
     """Evalúa pronóstico diario y devuelve alertas, riesgo y métricas resumidas."""
     alertas: List[str] = []
@@ -261,11 +368,11 @@ def evaluate_forecast(df_day: pd.DataFrame, thresholds: AlertThresholds) -> Tupl
     return alertas, risk, metrics
 
 
-def evaluate_policy(row: pd.Series, api_key: str, thresholds: AlertThresholds, days: int = 3) -> Dict[str, Any]:
+def evaluate_policy(row: pd.Series, api_key: str, thresholds: AlertThresholds, days: int = 3, provider: str = "Auto: Visual Crossing + fallback Open-Meteo") -> Dict[str, Any]:
     """Ejecuta consulta y evaluación para una póliza/campo."""
     lat = float(row["LAT_NUM"])
     lon = float(row["LON_NUM"])
-    df_day, status = fetch_visual_crossing(lat, lon, api_key=api_key, days=days)
+    df_day, status = fetch_weather_forecast(lat, lon, api_key=api_key, days=days, provider=provider)
 
     base = {
         "IT": row.get("IT", ""),

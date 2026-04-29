@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import io
+import json
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -15,6 +15,8 @@ from alert_engine import (
     EmailConfig,
     build_alert_map,
     evaluate_policy,
+    fetch_visual_crossing,
+    fetch_weather_forecast,
     map_to_html_file,
     prepare_policies,
     send_email_alerts,
@@ -52,7 +54,8 @@ st.markdown(
 
 def get_secret(name: str, default: str = "") -> str:
     try:
-        return st.secrets.get(name, default)
+        value = st.secrets.get(name, default)
+        return str(value) if value is not None else default
     except Exception:
         return default
 
@@ -74,7 +77,7 @@ def _cell_to_streamlit_safe(value):
     if isinstance(value, (list, tuple, set)):
         return " | ".join(str(v) for v in value)
     if isinstance(value, dict):
-        return str(value)
+        return json.dumps(value, ensure_ascii=False)
     if pd.isna(value):
         return ""
     return str(value)
@@ -114,7 +117,13 @@ def safe_folium_map(fmap, height: int = 620):
             return st_folium(fmap, height=height, use_container_width=True)
 
 
-def run_scan(df_policies: pd.DataFrame, api_key: str, thresholds: AlertThresholds, max_workers: int) -> pd.DataFrame:
+def looks_like_placeholder_api_key(api_key: str) -> bool:
+    k = str(api_key or "").strip().lower()
+    bad_tokens = ["tu_api_key", "pegar_aca", "api_key", "visualcrossing_api_key", "xxx", "changeme"]
+    return (not k) or any(token in k for token in bad_tokens) or len(k) < 10
+
+
+def run_scan(df_policies: pd.DataFrame, api_key: str, thresholds: AlertThresholds, max_workers: int, provider: str) -> pd.DataFrame:
     results = []
     total = len(df_policies)
     progress = st.progress(0, text="Preparando consultas meteorológicas...")
@@ -122,14 +131,34 @@ def run_scan(df_policies: pd.DataFrame, api_key: str, thresholds: AlertThreshold
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(evaluate_policy, row, api_key, thresholds, 3): idx
+            executor.submit(evaluate_policy, row, api_key, thresholds, 3, provider): idx
             for idx, row in df_policies.iterrows()
         }
         for i, fut in enumerate(as_completed(futures), start=1):
+            idx = futures[fut]
             try:
                 results.append(fut.result())
             except Exception as exc:  # noqa: BLE001
-                results.append({"RIESGO": "Sin dato", "TIENE_ALERTA": False, "API_STATUS": f"Error: {exc}"})
+                row = df_policies.loc[idx]
+                results.append(
+                    {
+                        "IT": row.get("IT", ""),
+                        "ASEGURADO": row.get("ASEGURADO", ""),
+                        "CULTIVO": row.get("CULTIVO", ""),
+                        "CAMPO": row.get("CAMPO", ""),
+                        "PROVINCIA": row.get("PROVINCIA", ""),
+                        "DEPTO": row.get("DEPTO", ""),
+                        "LOCALIDAD": row.get("LOCALIDAD", ""),
+                        "HAS": row.get("HAS", None),
+                        "LAT": row.get("LAT_NUM", None),
+                        "LON": row.get("LON_NUM", None),
+                        "RIESGO": "Sin dato",
+                        "ALERTAS": [],
+                        "ALERTAS_TXT": "",
+                        "TIENE_ALERTA": False,
+                        "API_STATUS": f"Error interno al evaluar póliza: {type(exc).__name__}: {exc}",
+                    }
+                )
             progress.progress(i / total, text=f"Consultando clima y evaluando pólizas: {i}/{total}")
             if i % 10 == 0 or i == total:
                 status_box.caption(f"Procesadas {i:,} de {total:,} pólizas")
@@ -137,6 +166,42 @@ def run_scan(df_policies: pd.DataFrame, api_key: str, thresholds: AlertThreshold
     progress.empty()
     status_box.empty()
     return pd.DataFrame(results)
+
+
+def render_api_diagnostic(df_results: pd.DataFrame) -> None:
+    st.markdown("### Diagnóstico de respuestas climáticas")
+    if "API_STATUS" not in df_results.columns:
+        st.info("No hay columna API_STATUS para diagnosticar.")
+        return
+
+    status_counts = (
+        df_results["API_STATUS"]
+        .fillna("Sin estado")
+        .astype(str)
+        .value_counts()
+        .reset_index()
+    )
+    status_counts.columns = ["API_STATUS", "CANTIDAD"]
+    safe_dataframe(status_counts)
+
+    sin_dato = df_results[df_results.get("RIESGO", "") == "Sin dato"].copy()
+    if not sin_dato.empty:
+        st.markdown("**Muestra de pólizas sin dato clima**")
+        diag_cols = ["ASEGURADO", "CAMPO", "PROVINCIA", "DEPTO", "LAT", "LON", "API_STATUS"]
+        diag_cols = [c for c in diag_cols if c in sin_dato.columns]
+        safe_dataframe(sin_dato[diag_cols].head(30))
+
+    st.markdown(
+        """
+**Cómo interpretar esto**
+
+- `Falta VISUALCROSSING_API_KEY`: la app no está leyendo el secret o la clave no fue ingresada.
+- `HTTP 401 / 403`: clave inválida, sin permisos o mal pegada.
+- `HTTP 429`: límite de consultas alcanzado o demasiadas consultas en paralelo.
+- `Timeout`: la API no respondió a tiempo; bajá las consultas en paralelo a 1 o 2.
+- `Respuesta sin bloque 'days'`: la API respondió, pero no con el formato esperado.
+"""
+    )
 
 
 st.title("🌦️ Sistema de Alertas Meteorológicas para Pólizas Agrícolas")
@@ -150,7 +215,26 @@ with st.sidebar:
         value=get_secret("VISUALCROSSING_API_KEY", ""),
         type="password",
         help="En Streamlit Cloud configurala como secret: VISUALCROSSING_API_KEY",
+    ).strip()
+
+    provider = st.selectbox(
+        "Fuente meteorológica",
+        [
+            "Auto: Visual Crossing + fallback Open-Meteo",
+            "Open-Meteo sin API key",
+            "Visual Crossing únicamente",
+        ],
+        index=0,
+        help=(
+            "Auto intenta Visual Crossing si hay API key y, si falla, usa Open-Meteo. "
+            "Open-Meteo no requiere API key."
+        ),
     )
+
+    provider_requires_key = provider == "Visual Crossing únicamente"
+
+    if looks_like_placeholder_api_key(api_key) and provider != "Open-Meteo sin API key":
+        st.warning("La API key parece vacía, incompleta o placeholder. En modo Auto la app usará Open-Meteo como fallback.")
 
     st.subheader("Umbrales de alerta")
     lluvia_mm_dia = st.number_input("Lluvia intensa diaria (mm)", min_value=0.0, value=30.0, step=1.0)
@@ -168,7 +252,7 @@ with st.sidebar:
     st.subheader("Ejecución")
     only_gruesa = st.checkbox("Filtrar solo campaña gruesa", value=True)
     max_policies = st.number_input("Máximo de pólizas a consultar", min_value=1, value=200, step=50)
-    max_workers = st.slider("Consultas en paralelo", min_value=1, max_value=10, value=4)
+    max_workers = st.slider("Consultas en paralelo", min_value=1, max_value=10, value=2)
     include_no_alerts_map = st.checkbox("Mostrar también campos sin alerta en el mapa", value=False)
 
 uploaded = st.file_uploader("Subí el Excel de pólizas", type=["xlsx", "xls"])
@@ -228,14 +312,34 @@ if len(filtered) > int(max_policies):
 
 st.write(f"**Pólizas listas para consultar:** {len(filtered):,}")
 
-if not api_key:
+if not api_key and provider == "Visual Crossing únicamente":
     st.warning("Falta configurar la API key de Visual Crossing. Podés ingresarla en la barra lateral o cargarla como secret en Streamlit Cloud.")
+elif not api_key and provider != "Visual Crossing únicamente":
+    st.info("No hay API key de Visual Crossing. La app puede ejecutar igual usando Open-Meteo.")
 
-run = st.button("🚀 Ejecutar sistema de alertas", type="primary", disabled=not bool(api_key) or len(filtered) == 0)
+col_test, col_run = st.columns([1, 2])
+with col_test:
+    test_api = st.button("🧪 Probar fuente climática con 1 póliza", disabled=(provider == "Visual Crossing únicamente" and not bool(api_key)) or len(filtered) == 0)
+with col_run:
+    run = st.button("🚀 Ejecutar sistema de alertas", type="primary", disabled=(provider == "Visual Crossing únicamente" and not bool(api_key)) or len(filtered) == 0)
+
+if test_api:
+    first = filtered.iloc[0]
+    with st.spinner(f"Probando fuente climática: {provider}..."):
+        df_day, status = fetch_weather_forecast(float(first["LAT_NUM"]), float(first["LON_NUM"]), api_key=api_key, days=3, provider=provider)
+    if str(status).startswith("OK") and df_day is not None:
+        st.success(f"La fuente climática respondió OK para la primera póliza: {status}")
+        safe_dataframe(df_day)
+    else:
+        st.error(f"La prueba de fuente climática falló: {status}")
+        st.info("Si Visual Crossing falla, probá seleccionar 'Open-Meteo sin API key' o dejá el modo Auto para usar fallback.")
 
 if run:
-    with st.spinner("Ejecutando consultas meteorológicas..."):
-        df_results = run_scan(filtered, api_key, thresholds, max_workers=max_workers)
+    if provider == "Visual Crossing únicamente" and looks_like_placeholder_api_key(api_key):
+        st.error("La API key parece inválida o placeholder. Corregila o cambiá la fuente a Open-Meteo / Auto.")
+        st.stop()
+    with st.spinner(f"Ejecutando consultas meteorológicas con fuente: {provider}..."):
+        df_results = run_scan(filtered, api_key, thresholds, max_workers=max_workers, provider=provider)
     st.session_state["df_results"] = df_results
 
 if "df_results" not in st.session_state:
@@ -247,6 +351,7 @@ if "TIENE_ALERTA" not in df_results.columns:
     st.stop()
 
 alerts_df = df_results[df_results["TIENE_ALERTA"]].copy()
+sin_dato_api = int((df_results["RIESGO"] == "Sin dato").sum())
 
 st.subheader("Resultado del monitoreo 72h")
 r1, r2, r3, r4, r5 = st.columns(5)
@@ -254,72 +359,101 @@ r1.metric("Pólizas consultadas", f"{len(df_results):,}")
 r2.metric("Con alerta", f"{len(alerts_df):,}")
 r3.metric("Riesgo alto", f"{int((df_results['RIESGO'] == 'Alto').sum()):,}")
 r4.metric("Riesgo muy alto", f"{int((df_results['RIESGO'] == 'Muy Alto').sum()):,}")
-r5.metric("Sin dato API", f"{int((df_results['RIESGO'] == 'Sin dato').sum()):,}")
+r5.metric("Sin dato clima", f"{sin_dato_api:,}")
 
-if alerts_df.empty:
-    st.success("No se detectaron alertas con los umbrales configurados.")
+if sin_dato_api == len(df_results):
+    st.error("Todas las consultas quedaron sin dato clima. Esto no significa ausencia de alertas: hay que revisar API key, límite/rate limit o conectividad.")
+elif sin_dato_api > 0:
+    st.warning(f"Hay {sin_dato_api:,} pólizas sin dato clima. Revisá la pestaña Diagnóstico API.")
+elif alerts_df.empty:
+    st.success("La API respondió correctamente y no se detectaron alertas con los umbrales configurados.")
 else:
-    tab1, tab2, tab3, tab4 = st.tabs(["📍 Mapa", "📋 Alertas", "📊 Resumen", "✉️ Email"])
+    st.warning(f"Se detectaron {len(alerts_df):,} pólizas con alerta.")
 
-    with tab1:
-        fmap = build_alert_map(df_results, include_no_alerts=include_no_alerts_map)
-        if fmap:
-            safe_folium_map(fmap, height=620)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
-                map_path = map_to_html_file(fmap, tmp.name)
-                st.download_button(
-                    "Descargar mapa HTML",
-                    data=Path(map_path).read_bytes(),
-                    file_name="mapa_alertas.html",
-                    mime="text/html",
-                )
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📍 Mapa", "📋 Resultados", "🧪 Diagnóstico API", "📊 Resumen", "✉️ Email"])
+
+with tab1:
+    fmap = build_alert_map(df_results, include_no_alerts=(include_no_alerts_map or alerts_df.empty))
+    if fmap:
+        safe_folium_map(fmap, height=620)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
+            map_path = map_to_html_file(fmap, tmp.name)
+            st.download_button(
+                "Descargar mapa HTML",
+                data=Path(map_path).read_bytes(),
+                file_name="mapa_alertas.html",
+                mime="text/html",
+            )
+    else:
+        st.info("No hay puntos para mostrar en el mapa.")
+
+with tab2:
+    cols = [
+        "RIESGO",
+        "ASEGURADO",
+        "CAMPO",
+        "CULTIVO",
+        "PROVINCIA",
+        "DEPTO",
+        "LOCALIDAD",
+        "HAS",
+        "LLUVIA_72H_MM",
+        "LLUVIA_MAX_DIA_MM",
+        "VIENTO_MAX_KMH",
+        "TMIN_MIN_C",
+        "ALERTAS_TXT",
+        "API_STATUS",
+    ]
+    show_cols = [c for c in cols if c in df_results.columns]
+    sort_cols = [c for c in ["TIENE_ALERTA", "RIESGO"] if c in df_results.columns]
+
+    # Ordenar antes de seleccionar columnas visibles.
+    table = df_results.copy()
+    if sort_cols:
+        ascending = [False] * len(sort_cols)
+        table = table.sort_values(sort_cols, ascending=ascending, na_position="last")
+
+    if show_cols:
+        table = table[show_cols]
+
+    safe_dataframe(table)
+    st.download_button(
+        "Descargar resultados CSV",
+        data=to_csv_bytes(df_results),
+        file_name="alertas_meteorologicas_72h.csv",
+        mime="text/csv",
+    )
+
+with tab3:
+    render_api_diagnostic(df_results)
+
+with tab4:
+    g1, g2 = st.columns(2)
+    with g1:
+        risk_counts = df_results["RIESGO"].value_counts().reset_index()
+        risk_counts.columns = ["RIESGO", "CANTIDAD"]
+        fig = px.bar(risk_counts, x="RIESGO", y="CANTIDAD", title="Distribución por nivel de riesgo")
+        safe_plotly_chart(fig)
+    with g2:
+        if alerts_df.empty:
+            st.info("No hay alertas para graficar por provincia.")
         else:
-            st.info("No hay puntos para mostrar en el mapa.")
-
-    with tab2:
-        cols = [
-            "RIESGO",
-            "ASEGURADO",
-            "CAMPO",
-            "CULTIVO",
-            "PROVINCIA",
-            "DEPTO",
-            "LOCALIDAD",
-            "HAS",
-            "LLUVIA_72H_MM",
-            "LLUVIA_MAX_DIA_MM",
-            "VIENTO_MAX_KMH",
-            "TMIN_MIN_C",
-            "ALERTAS_TXT",
-            "API_STATUS",
-        ]
-        show_cols = [c for c in cols if c in df_results.columns]
-        safe_dataframe(df_results[show_cols].sort_values(["TIENE_ALERTA", "RIESGO"], ascending=[False, False]))
-        st.download_button(
-            "Descargar resultados CSV",
-            data=to_csv_bytes(df_results),
-            file_name="alertas_meteorologicas_72h.csv",
-            mime="text/csv",
-        )
-
-    with tab3:
-        g1, g2 = st.columns(2)
-        with g1:
-            risk_counts = df_results["RIESGO"].value_counts().reset_index()
-            risk_counts.columns = ["RIESGO", "CANTIDAD"]
-            fig = px.bar(risk_counts, x="RIESGO", y="CANTIDAD", title="Distribución por nivel de riesgo")
-            safe_plotly_chart(fig)
-        with g2:
             prov_counts = alerts_df.groupby("PROVINCIA", dropna=False).size().reset_index(name="ALERTAS").sort_values("ALERTAS", ascending=False)
             fig2 = px.bar(prov_counts.head(15), x="PROVINCIA", y="ALERTAS", title="Alertas por provincia")
             safe_plotly_chart(fig2)
 
+    if "LLUVIA_72H_MM" in df_results.columns:
         st.markdown("**Top campos por lluvia acumulada 72h**")
         top_cols = ["ASEGURADO", "CAMPO", "PROVINCIA", "DEPTO", "CULTIVO", "LLUVIA_72H_MM", "VIENTO_MAX_KMH", "TMIN_MIN_C", "RIESGO"]
         top_cols = [c for c in top_cols if c in df_results.columns]
         safe_dataframe(df_results[top_cols].sort_values("LLUVIA_72H_MM", ascending=False).head(20))
+    else:
+        st.info("No hay métricas climáticas porque las consultas a la API no devolvieron pronóstico válido.")
 
-    with tab4:
+with tab5:
+    if alerts_df.empty:
+        st.info("No hay alertas para enviar por email. Si todas figuran como 'Sin dato clima', primero resolvé la API key/límite en Diagnóstico API.")
+    else:
         st.warning("Para enviar emails desde Streamlit Cloud, configurá credenciales en Secrets. No las subas al repo.")
         smtp_server = st.text_input("SMTP server", value=get_secret("SMTP_SERVER", "smtp.gmail.com"))
         smtp_port = st.number_input("SMTP port", min_value=1, value=int(get_secret("SMTP_PORT", 587)))

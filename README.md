@@ -1,47 +1,32 @@
 # Sistema de Alertas Meteorológicas para Pólizas Agrícolas
 
-App en Streamlit basada en el pipeline de alertas meteorológicas para pólizas agrícolas.
+App Streamlit para cargar pólizas agrícolas desde Excel, filtrar campaña gruesa, consultar pronóstico 72h en Visual Crossing y generar alertas por lluvia, viento y baja temperatura.
 
-La aplicación permite:
+## Archivos principales
 
-- Cargar un Excel de pólizas.
-- Normalizar coordenadas y cultivos.
-- Filtrar campaña gruesa.
-- Consultar pronóstico de 72 horas con Visual Crossing.
-- Detectar alertas por lluvia intensa, lluvia acumulada, viento fuerte y temperatura mínima.
-- Visualizar resultados en tabla, gráficos y mapa Folium.
-- Exportar resultados a CSV y mapa HTML.
-- Enviar alertas por email con mapa adjunto.
+- `app.py`: interfaz Streamlit.
+- `alert_engine.py`: motor de normalización, consulta API, alertas, mapa y email.
+- `requirements.txt`: dependencias.
+- `.streamlit/secrets.example.toml`: ejemplo de secrets.
+- `runtime.txt`: versión Python sugerida para Streamlit Cloud.
 
-## Estructura
+## Secrets requeridos
 
-```text
-.
-├── app.py
-├── alert_engine.py
-├── requirements.txt
-├── README.md
-├── .gitignore
-└── .streamlit/
-    ├── config.toml
-    └── secrets.example.toml
+En Streamlit Cloud, cargar en **App settings > Secrets**:
+
+```toml
+VISUALCROSSING_API_KEY = "tu_api_key"
+
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+EMAIL_USER = "tu_email@gmail.com"
+EMAIL_PASS = "tu_app_password"
+DEFAULT_RECIPIENT = "destinatario@empresa.com"
 ```
 
-## Columnas esperadas en el Excel
+No subir `.streamlit/secrets.toml` al repo.
 
-Mínimas:
-
-```text
-LATITUD, LONGITUD, CULTIVO
-```
-
-Recomendadas:
-
-```text
-IT, ASEGURADO, PROVINCIA, DEPTO, LOCALIDAD, CULTIVO, CAMPO, HAS, MONEDA, SUMA_ASEGURADA, ADICIONALES, LATITUD, LONGITUD, CAMPAÑA
-```
-
-## Ejecutar localmente
+## Ejecución local
 
 ```bash
 python -m venv .venv
@@ -50,50 +35,22 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-En macOS/Linux:
+## Diagnóstico de API
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-streamlit run app.py
-```
+Si el panel muestra `Sin dato API = total de pólizas`, no significa que no haya alertas. Significa que las consultas climáticas fallaron. Revisar la pestaña **Diagnóstico API**.
 
-## Configurar secrets localmente
+Estados comunes:
 
-Crear `.streamlit/secrets.toml` usando `.streamlit/secrets.example.toml` como base.
+- `Falta VISUALCROSSING_API_KEY`: falta cargar el secret o la clave.
+- `HTTP 401 / 403`: clave inválida, vencida o sin permisos.
+- `HTTP 429`: límite de uso alcanzado o demasiadas consultas paralelas.
+- `Timeout`: bajar consultas paralelas a 1 o 2 y reintentar.
+- `Respuesta sin bloque 'days'`: la API respondió con un formato distinto al esperado.
 
-```toml
-VISUALCROSSING_API_KEY = "tu_api_key"
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-EMAIL_USER = "tu_email@gmail.com"
-EMAIL_PASS = "tu_app_password"
-DEFAULT_RECIPIENT = "destinatario@empresa.com"
-```
+Antes de ejecutar 200 pólizas, usar el botón **Probar API con 1 póliza**.
 
-## Deploy en Streamlit Cloud
+## Nota de deploy en Streamlit Cloud
 
-1. Subir el repo a GitHub.
-2. Ir a Streamlit Community Cloud.
-3. Crear una nueva app desde el repo.
-4. Main file path: `app.py`.
-5. Cargar los secrets desde la sección **App settings > Secrets**.
-6. Deploy.
+Si Streamlit Cloud construye con Python 3.14 o 3.13, entrar en la app desde el dashboard, abrir Settings / Advanced settings y seleccionar Python 3.12. El archivo runtime.txt queda como referencia, pero en Community Cloud la selección confiable se hace desde la UI.
 
-## Seguridad
-
-No subir nunca al repo:
-
-- API keys.
-- App passwords de Gmail.
-- Excel reales con pólizas o datos sensibles.
-- Archivos `.streamlit/secrets.toml`.
-
-Si una credencial fue compartida o commiteada accidentalmente, rotarla inmediatamente.
-
-## Nota de compatibilidad Streamlit / PyArrow
-
-La app fuerza las columnas de texto/mixed object a string antes de mostrarlas con `st.dataframe`. Esto evita errores de PyArrow cuando el Excel trae columnas mixtas, por ejemplo `CAMPAÑA` con texto, números o valores vacíos.
-
-También se incluye `runtime.txt` para sugerir Python 3.12 en Streamlit Cloud.
+Recomendación de estructura del repo: dejar `app.py`, `alert_engine.py`, `requirements.txt`, `runtime.txt`, `.gitignore` y la carpeta `.streamlit/` directamente en la raíz del repositorio. En ese caso el Main file path es `app.py`.
